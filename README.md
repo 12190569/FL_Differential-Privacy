@@ -1,4 +1,4 @@
-Federated Learning with Differential Privacy Strategies
+1. Federated Learning with Differential Privacy Strategies
 This repository implements and compares five different Differential Privacy (DP) strategies in Federated Learning (FL) settings using the MNIST dataset.
 
 🎯 Strategies Implemented
