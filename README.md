@@ -1,15 +1,13 @@
-1. Federated Learning with Differential Privacy Strategies
+**Federated Learning with Differential Privacy Strategies**
 This repository implements and compares five different Differential Privacy (DP) strategies in Federated Learning (FL) settings using the MNIST dataset.
 
-🎯 Strategies Implemented
+🎯 **Strategies Implemented**
 1. Static DP
 Location: server_static_dp.py, client_static_dp.py
 
 Port: 8080
 
 Description: Fixed ε allocation for all clients at every round
-
-Based on: Wei et al. [1]
 
 Features:
 
