@@ -1,223 +1,312 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import argparse
+import math
+import random
+import sys
+from dataclasses import dataclass
+from typing import Tuple
+
 import flwr as fl
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from torchvision import datasets, transforms
-import math
-import os
-from torch.utils.data import TensorDataset, DataLoader
 
-class OptimizedNet(nn.Module):
-    """Rede neural otimizada para MNIST"""
+
+# ------------------------
+# Util & Modelo
+# ------------------------
+
+def _hdr(client_id: int) -> None:
+    print(f"### AGENTIC-DP CLIENT v4 ### PYTHON= {sys.executable} FLWR= {fl.__version__}")
+    print(f"✅ Cliente {client_id} - inicializando...")
+    sys.stdout.flush()
+
+
+class Net(nn.Module):
     def __init__(self):
-        super(OptimizedNet, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(9216, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 10)
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(28 * 28, 128)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
-        x = torch.flatten(x, 1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout2(x)
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return F.log_softmax(x, dim=1)
+        x = self.flatten(x)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)  # logits
+        return x
 
-class AgenticDPClient(fl.client.NumPyClient):
-    def __init__(self, client_id: int):
-        self.client_id = client_id
-        self.client_type = "agentic-dp"
-        self.net = OptimizedNet()
-        self.trainloader, self.testloader = self.load_data(client_id)
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.001)
-        self.loss_history = []
-        self.accuracy_history = []
-        self.gradient_importance_history = []
-        
-        print(f"🚀 Cliente Agentic DP {client_id} inicializado")
 
-    def load_data(self, client_id):
-        """Carrega dados MNIST com fallback para dados dummy"""
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        
-        try:
-            train_dataset = datasets.MNIST('./data', train=True, download=False, transform=transform)
-            test_dataset = datasets.MNIST('./data', train=False, download=False, transform=transform)
-            print(f"✅ Cliente {client_id} - MNIST carregado")
-        except:
-            dummy_data = torch.randn(1000, 1, 28, 28)
-            dummy_targets = torch.randint(0, 10, (1000,))
-            train_dataset = TensorDataset(dummy_data, dummy_targets)
-            test_dataset = TensorDataset(dummy_data, dummy_targets)
-            print(f"📦 Cliente {client_id} - Usando dados dummy")
-        
-        train_size = len(train_dataset) // 4
-        test_size = len(test_dataset) // 4
-        
-        train_start = client_id * train_size
-        train_end = min((client_id + 1) * train_size, len(train_dataset))
-        test_start = client_id * test_size
-        test_end = min((client_id + 1) * test_size, len(test_dataset))
-        
-        train_subset = torch.utils.data.Subset(train_dataset, range(train_start, train_end))
-        test_subset = torch.utils.data.Subset(test_dataset, range(test_start, test_end))
-        
-        print(f"📊 Cliente {client_id} - Treino: {len(train_subset)}, Teste: {len(test_subset)}")
-        
-        return (
-            DataLoader(train_subset, batch_size=64, shuffle=True),
-            DataLoader(test_subset, batch_size=64)
+def partition_dataset(dataset, cid: int, num_clients: int):
+    n = len(dataset)
+    shard = n // num_clients
+    start = cid * shard
+    end = (cid + 1) * shard if cid < num_clients - 1 else n
+    subset = torch.utils.data.Subset(dataset, list(range(start, end)))
+    return subset
+
+
+@dataclass
+class AgentConfig:
+    eps_budget_total: float = 18.0
+    eps_max_round: float = 2.5
+    eps_min_train: float = 0.20       # abaixo disso, pula treino
+    clip_norm: float = 1.0
+    lr: float = 1e-3                  # Adam base
+    batch_size: int = 128
+    local_epochs: int = 1
+    k_nm: float = 0.5                 # k para noise_multiplier ~ k/eps
+    nm_min: float = 0.05
+    nm_max: float = 1.5
+    seed: int = 42
+
+
+class PrivacyAgent:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        self.budget_rem = cfg.eps_budget_total
+
+    def _probe_importance(self, probe_loss: float) -> float:
+        # Importância ∈ [0.2, 0.8] mapeada a partir da perda de sonda
+        x = max(0.0, min(3.0, probe_loss - 1.5))
+        imp = 0.2 + 0.6 * (math.tanh(x) * 0.5 + 0.5)
+        return float(max(0.0, min(1.0, imp)))
+
+    def decide_epsilon(self, round_idx: int, num_rounds: int, probe_loss: float) -> float:
+        """Decisão stateful com limitador de ritmo de gasto por rodada restante."""
+        if self.budget_rem <= 0.0:
+            return 0.0
+
+        imp = self._probe_importance(probe_loss)
+        urgency = 0.4 + 0.6 * (round_idx / max(1, num_rounds))  # 0.4..1.0
+        r = max(0.05, min(1.0, self.budget_rem / self.cfg.eps_budget_total))
+
+        base = (0.9 * imp + 0.6 * urgency) * self.cfg.eps_max_round
+        candidate = base * r
+
+        # Limitador de ritmo: não gastar muito acima da média restante
+        rounds_left = max(1, num_rounds - round_idx + 1)
+        pace = self.budget_rem / rounds_left
+        candidate = min(candidate, 2.0 * pace)  # no máx. 2x da média restante
+
+        # Limites finais
+        candidate = max(0.0, min(candidate, self.cfg.eps_max_round, self.budget_rem))
+        return float(candidate)
+
+    def spend(self, eps: float) -> None:
+        self.budget_rem = float(max(0.0, self.budget_rem - eps))
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def noise_std_from_epsilon(
+    clip_norm: float, eps: float, batch_size: int, k_nm: float, nm_min: float, nm_max: float
+) -> float:
+    """DP-SGD style: std = (nm * clip_norm) / batch_size, nm ~ k/eps (clamped)."""
+    eps = max(eps, 1e-3)
+    nm = k_nm / eps
+    nm = max(nm_min, min(nm_max, nm))
+    return float((nm * clip_norm) / max(1, batch_size))
+
+
+# ------------------------
+# Cliente Flower
+# ------------------------
+
+class AgenticClient(fl.client.NumPyClient):
+    def __init__(self, cid: int, server_addr: str, num_clients: int, cfg: AgentConfig, device: torch.device):
+        self.cid = cid
+        self.server_addr = server_addr
+        self.num_clients = num_clients
+        self.cfg = cfg
+        self.device = device
+
+        set_seed(cfg.seed + cid)
+
+        # Dados
+        transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
         )
+        train_ds_full = datasets.MNIST("./data", train=True, download=True, transform=transform)
+        test_ds_full = datasets.MNIST("./data", train=False, download=True, transform=transform)
+        self.train_ds = partition_dataset(train_ds_full, cid, num_clients)
+        self.test_ds = partition_dataset(test_ds_full, cid, num_clients)
 
+        self.train_loader = torch.utils.data.DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True)
+        self.test_loader = torch.utils.data.DataLoader(self.test_ds, batch_size=512, shuffle=False)
+
+        # Modelo/otimizador
+        self.model = Net().to(self.device)
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.lr, weight_decay=1e-4)
+
+        # Agente stateful (mantém budget)
+        self.agent = PrivacyAgent(self.cfg)
+
+        self.last_importance = 0.5
+
+        print(f"📊 Cliente {cid} - Treino: {len(self.train_ds)}, Teste: {len(self.test_ds)}")
+        print(f"🚀 Cliente Agentic DP {cid} inicializado")
+        print(f"🌐 Conectando cliente {cid} ao servidor {self.server_addr}...")
+        sys.stdout.flush()
+
+    # Parâmetros
     def get_parameters(self, config):
-        return [val.cpu().numpy() for val in self.net.state_dict().values()]
+        return [val.detach().cpu().numpy() for _, val in self.model.state_dict().items()]
 
     def set_parameters(self, parameters):
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.net.state_dict().keys(), parameters)}
-        self.net.load_state_dict(state_dict, strict=True)
+        state_dict = self.model.state_dict()
+        for (k, _), p in zip(state_dict.items(), parameters):
+            state_dict[k] = torch.tensor(p, dtype=state_dict[k].dtype)
+        self.model.load_state_dict(state_dict)
 
-    def fit(self, parameters, config):
-        """Treinamento com Agentic DP"""
-        self.set_parameters(parameters)
-        
-        epsilon = config.get("epsilon", 8.0)
-        delta = config.get("delta", 1e-5)
-        clip_norm = config.get("clip_norm", 1.5)
-        learning_rate = config.get("learning_rate", 0.001)
-        epochs = config.get("epochs", 1)
-        round_idx = config.get("round", 0)
-        allocation_reason = config.get("allocation_reason", "N/A")
-        gradient_importance = config.get("gradient_importance", 0.5)
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = learning_rate
-        
-        self.net.train()
-        total_loss = 0
-        
-        for data, target in self.trainloader:
+    # Avaliação simples
+    def _eval_loss_acc(self, loader) -> Tuple[float, float]:
+        self.model.eval()
+        total, loss_sum, correct = 0, 0.0, 0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                out = self.model(x)
+                loss = self.criterion(out, y)
+                loss_sum += float(loss.item()) * x.size(0)
+                total += x.size(0)
+                pred = out.argmax(dim=1)
+                correct += int((pred == y).sum().item())
+        return loss_sum / max(1, total), correct / max(1, total)
+
+    def _train_with_dp(self, epsilon: float) -> float:
+        """1 época local com clipping + ruído gaussiano (escala por batch_size)."""
+        self.model.train()
+        loss_last = 0.0
+
+        # Escalar LR pela “qualidade” do passo (ε relativo ao máx.)
+        lr_scale = float(max(1e-3, epsilon / self.cfg.eps_max_round))
+        for g in self.optimizer.param_groups:
+            g["lr"] = max(1e-5, self.cfg.lr * lr_scale)
+
+        for x, y in self.train_loader:
+            x, y = x.to(self.device), y.to(self.device)
             self.optimizer.zero_grad()
-            output = self.net(data)
-            loss = F.nll_loss(output, target)
+            out = self.model(x)
+            loss = self.criterion(out, y)
             loss.backward()
-            
-            # Aplicar DP com ruído adaptativo baseado na importância
-            self.apply_adaptive_dp(clip_norm, epsilon, delta, gradient_importance)
-            
-            self.optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(self.trainloader)
-        self.loss_history.append(avg_loss)
-        self.gradient_importance_history.append(gradient_importance)
-        
-        print(f"🔒 Cliente {self.client_id} - R{round_idx}: "
-              f"ε={epsilon:.2f} ({allocation_reason}), "
-              f"Importância={gradient_importance:.2f}, Loss={avg_loss:.4f}")
-        
-        if round_idx % 2 == 0 and len(self.loss_history) > 1:
-            loss_change = self.loss_history[-2] - self.loss_history[-1]
-            trend = "↘️" if loss_change > 0 else "↗️" if loss_change < 0 else "➡️"
-            print(f"   📉 Progresso: Loss {avg_loss:.1f} {trend} (Δ{loss_change:+.1f})")
-        
-        return self.get_parameters(config), len(self.trainloader.dataset), {
-            "client_type": self.client_type,
-            "epsilon_used": epsilon,
-            "loss": avg_loss,
-            "client_id": self.client_id,
-            "allocation_reason": allocation_reason,
-            "gradient_importance": gradient_importance
-        }
 
-    def apply_adaptive_dp(self, clip_norm: float, epsilon: float, delta: float, importance: float):
-        """Aplica DP adaptativo baseado na importância dos gradientes"""
-        if epsilon <= 0:
-            return
-        
-        # Clipping de gradientes
-        total_norm = 0.0
-        for p in self.net.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        
-        clip_coef = clip_norm / (total_norm + 1e-6)
-        if clip_coef < 1:
-            for p in self.net.parameters():
+            # Clip global
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.clip_norm)
+
+            # Ruído DP por batch
+            std = noise_std_from_epsilon(
+                self.cfg.clip_norm, epsilon, self.cfg.batch_size, self.cfg.k_nm, self.cfg.nm_min, self.cfg.nm_max
+            )
+            for p in self.model.parameters():
                 if p.grad is not None:
-                    p.grad.data.mul_(clip_coef)
-        
-        # Ajustar ruído baseado na importância (mais importância = menos ruído)
-        importance_factor = 1.0 - (importance * 0.3)  # 0.7 to 1.0 range
-        effective_epsilon = epsilon * importance_factor
-        
-        # Calcular e aplicar ruído
-        sigma = math.sqrt(2 * math.log(1.25 / delta)) / effective_epsilon
-        
-        for p in self.net.parameters():
-            if p.grad is not None:
-                noise = torch.normal(0, sigma * clip_norm, p.grad.shape)
-                p.grad.data.add_(noise)
+                    noise = torch.normal(mean=0.0, std=std, size=p.grad.shape,
+                                         device=p.grad.device, dtype=p.grad.dtype)
+                    p.grad.add_(noise)
+
+            self.optimizer.step()
+            loss_last = float(loss.item())
+
+        return loss_last
+
+    # Métodos Flower
+    def fit(self, parameters, config):
+        round_idx = int(config.get("round", 0))
+        num_rounds = int(config.get("num_rounds", 1))
+
+        # Recebe parâmetros globais
+        self.set_parameters(parameters)
+
+        # "Sonda" de importância
+        probe_loss, _ = self._eval_loss_acc(self.train_loader)
+        imp = self.agent._probe_importance(probe_loss)
+
+        # Decide ε com orçamento stateful e pace limit
+        epsilon = self.agent.decide_epsilon(round_idx, num_rounds, probe_loss)
+
+        # Pular treino se ε muito baixo (mas reportar num_examples > 0)
+        if epsilon <= self.cfg.eps_min_train or self.agent.budget_rem <= 0.0:
+            self.last_importance = imp
+            print(f"⚠️ Cliente {self.cid} - R{round_idx}: ε≈0 -> pulando treino "
+                  f"(budget_restante={self.agent.budget_rem:.2f})")
+            return self.get_parameters(config), len(self.train_ds), {
+                "epsilon": 0.0,
+                "loss": float(probe_loss),
+                "importance": float(imp),
+                "budget_remaining": float(self.agent.budget_rem),
+            }
+
+        # Treina com DP
+        last_loss = self._train_with_dp(epsilon)
+        # Consome orçamento
+        self.agent.spend(epsilon)
+        self.last_importance = imp
+
+        why = []
+        if self.agent.budget_rem > self.cfg.eps_budget_total * 0.5:
+            why.append("orçamento alto")
+        if imp >= 0.6:
+            why.append("importância alta")
+        if round_idx / max(1, num_rounds) >= 0.5:
+            why.append("urgência")
+        why_s = " / ".join(why) if why else "normal"
+
+        print(
+            f"🔒 Cliente {self.cid} - R{round_idx}: ε={epsilon:.2f} ({why_s}), "
+            f"Imp={imp:.2f}, Loss={last_loss:.4f}"
+        )
+        sys.stdout.flush()
+
+        return self.get_parameters(config), len(self.train_ds), {
+            "epsilon": float(epsilon),
+            "loss": float(last_loss),
+            "importance": float(imp),
+            "budget_remaining": float(self.agent.budget_rem),
+        }
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        self.net.eval()
-        
-        test_loss, correct = 0, 0
-        with torch.no_grad():
-            for data, target in self.testloader:
-                output = self.net(data)
-                test_loss += F.nll_loss(output, target, reduction='sum').item()
-                pred = output.argmax(dim=1)
-                correct += pred.eq(target).sum().item()
-        
-        test_loss /= len(self.testloader.dataset)
-        accuracy = correct / len(self.testloader.dataset)
-        self.accuracy_history.append(accuracy)
-        
-        print(f"📊 Cliente {self.client_id} - Avaliação: "
-              f"Loss={test_loss:.4f}, Acc={accuracy:.3f}")
-        
-        if len(self.accuracy_history) > 1:
-            acc_change = self.accuracy_history[-1] - self.accuracy_history[-2]
-            trend = "↗️" if acc_change > 0 else "↘️" if acc_change < 0 else "➡️"
-            print(f"   📈 Accuracy: {accuracy:.3f} {trend} (Δ{acc_change:+.3f})")
-        
-        return test_loss, len(self.testloader.dataset), {"accuracy": accuracy}
+        loss, acc = self._eval_loss_acc(self.test_loader)
+        print(f"📊 Cliente {self.cid} - Avaliação: Loss={loss:.4f}, Acc={acc:.3f}")
+        sys.stdout.flush()
+        return float(loss), len(self.test_ds), {"accuracy": float(acc)}
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", type=str, default="127.0.0.1:8084")
+    p.add_argument("--cid", type=int, required=True)
+    p.add_argument("--num_clients", type=int, default=4)
+    return p.parse_args()
+
 
 def main():
-    import sys
-    if len(sys.argv) != 2:
-        print("Uso: python client_agentic_dp.py <client_id>")
-        return
-    
-    client_id = int(sys.argv[1])
-    
-    try:
-        client = AgenticDPClient(client_id)
-        print(f"🌐 Conectando cliente {client_id} ao servidor Agentic DP...")
-        fl.client.start_client(
-            server_address="0.0.0.0:8084",
-            client=client.to_client(),
-        )
-        print(f"✅ Cliente {client_id} finalizado")
-    except Exception as e:
-        print(f"❌ Erro no cliente {client_id}: {e}")
+    args = parse_args()
+    _hdr(args.cid)
+    device = torch.device("cpu")
+    cfg = AgentConfig()
+
+    client = AgenticClient(
+        cid=args.cid,
+        server_addr=args.server,
+        num_clients=args.num_clients,
+        cfg=cfg,
+        device=device,
+    )
+
+    # Usa .to_client() para remover o warning deprecação do tipo
+    fl.client.start_client(server_address=args.server, client=client.to_client())
+
 
 if __name__ == "__main__":
     main()
+

@@ -1,75 +1,41 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=== EXPERIMENTO AGENTIC DP ==="
+PORT="${PORT:-8084}"
+ROUNDS="${ROUNDS:-15}"
+NUM_CLIENTS="${NUM_CLIENTS:-4}"
+PY="${PY:-python}"
+LOGDIR="${LOGDIR:-.}"
 
-# Configurações
-PORT=8084  # 🆕 Porta diferente
-TIMEOUT=600
+mkdir -p "$LOGDIR"
+export PYTHONUNBUFFERED=1
+export GRPC_VERBOSITY=ERROR
 
-# Limpar ambiente
-echo "🧹 Limpando ambiente..."
-pkill -f "python server.py"
-pkill -f "python client.py"
-lsof -ti:${PORT} | xargs kill -9 2>/dev/null
-rm -f metrics_agentic.json server.log client_*.log
-sleep 2
+echo "Using: PY=$PY | PORT=$PORT | ROUNDS=$ROUNDS | NUM_CLIENTS=$NUM_CLIENTS"
+echo "Logs em: $LOGDIR"
 
-# Verificar MNIST
-echo "🔍 Verificando MNIST..."
-if [ ! -d "data/MNIST/raw" ] || [ -z "$(ls -A data/MNIST/raw 2>/dev/null)" ]; then
-    echo "❌ MNIST não encontrado. Baixando..."
-    python download_mnist.py
-fi
+# ---- Server ----
+$PY -u server.py --port "$PORT" --rounds "$ROUNDS" --logdir "$LOGDIR" \
+  2>&1 | tee "$LOGDIR/server.log" &
 
-# Iniciar servidor
-echo "🚀 Iniciando servidor Agentic DP na porta ${PORT}..."
-python server.py > server.log 2>&1 &
 SERVER_PID=$!
-echo "Servidor PID: $SERVER_PID"
-
-# Aguardar servidor
-echo "⏳ Aguardando servidor..."
-for i in {1..30}; do
-    if lsof -Pi :${PORT} -sTCP:LISTEN -t >/dev/null; then
-        echo "✅ Servidor pronto na porta ${PORT}"
-        break
-    fi
-    sleep 1
-done
-
 sleep 3
 
-# Iniciar clientes
-echo "👥 Iniciando 4 clientes Agentic DP..."
-for i in {0..3}; do
-    echo "   Cliente $i (alocação personalizada de ε)..."
-    python client.py $i > client_$i.log 2>&1 &
-    sleep 1
+# ---- Clients ----
+PIDS=()
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
+  echo "Iniciando cliente $i ..."
+  $PY -u client.py --server "127.0.0.1:${PORT}" --cid "$i" --num_clients "$NUM_CLIENTS" \
+    2>&1 | tee "$LOGDIR/client_${i}.log" &
+  PIDS+=($!)
+  sleep 1
 done
 
-echo "=========================================="
-echo "📊 Agentic DP em andamento..."
-echo "🔍 Monitorar: tail -f server.log"
-echo "🌐 Porta: ${PORT}"
-echo "⏰ Timeout: ${TIMEOUT}s"
-echo "=========================================="
+# ---- Espera servidor terminar e encerra clientes ----
+wait $SERVER_PID || true
+for pid in "${PIDS[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" || true
+  fi
+done
 
-# Wait for completion
-wait $SERVER_PID 2>/dev/null
-
-echo "✅ Experimento Agentic DP concluído!"
-echo "📈 Métricas: metrics_agentic.json"
-
-# Resultados
-if [ -f "metrics_agentic.json" ]; then
-    python3 -c "
-import json
-with open('metrics_agentic.json') as f:
-    data = json.load(f)
-print('📊 RESULTADOS AGENTIC DP:')
-print(f'🎯 Acurácia final: {data.get(\"final_accuracy\", 0):.3f}')
-print(f'🔒 Total ε usado: {data.get(\"total_epsilon_used\", 0):.1f}')
-print(f'⚖️  Fairness médio: {data.get(\"avg_fairness\", 0):.3f}')
-print(f'📈 Eficiência: {data.get(\"final_accuracy\", 0)/data.get(\"total_epsilon_used\", 1):.3f}% por ε')
-"
-fi
